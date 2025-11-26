@@ -1,0 +1,33 @@
+{
+    "seed": 42,
+    "device": "cuda:0",
+    "data_path": "data/data",
+    "text_vocab_size": 10000,
+    "text_embed_dim": 128,
+    "text_max_len": 100,
+    "text_batch_size": 64,
+    "text_epochs": 50,
+    "text_lr": 0.001,
+    "img_size": 48,
+    "img_channels": 1,
+    "img_batch_size": 64,
+    "img_epochs": 100,
+    "img_lr": 0.001,
+    "text_emotions": [
+        "anger",
+        "fear",
+        "joy",
+        "love",
+        "sadness",
+        "surprise"
+    ],
+    "facial_emotions": [
+        "angry",
+        "disgust",
+        "fear",
+        "happy",
+        "neutral",
+        "sad",
+        "surprise"
+    ]
+}

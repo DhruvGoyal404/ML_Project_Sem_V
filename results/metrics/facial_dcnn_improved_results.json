@@ -1,0 +1,17 @@
+{
+    "test_acc": 0.6263583170799666,
+    "precision": 0.6257961171060099,
+    "recall": 0.6263583170799666,
+    "f1": 0.6216819756535175,
+    "train_time": 895.961742401123,
+    "best_epoch": 139,
+    "total_params": 9807047,
+    "improvements": [
+        "Batch Normalization",
+        "ELU Activation",
+        "Class Weights",
+        "Advanced Callbacks",
+        "5-block architecture",
+        "Optimized dropout"
+    ]
+}
