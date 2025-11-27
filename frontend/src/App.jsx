@@ -7,10 +7,10 @@ function App() {
   const [activeMode, setActiveMode] = useState(null); // 'text' or 'image'
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-100 to-gray-200">
+    <div className="min-h-screen bg-gradient-to-br from-gray-100 to-gray-200 flex flex-col">
       <Header />
 
-      <main className="container mx-auto px-4 py-8">
+      <main className="container mx-auto px-4 py-8 flex-grow flex items-center justify-center">
         {/* Mode Selection */}
         {!activeMode && (
           <div className="max-w-2xl mx-auto">
@@ -50,7 +50,7 @@ function App() {
 
         {/* Active Mode */}
         {activeMode && (
-          <div>
+          <div className="w-full">
             <button
               onClick={() => setActiveMode(null)}
               className="mb-6 flex items-center text-blue-600 hover:text-blue-800 font-semibold"
@@ -68,10 +68,10 @@ function App() {
       </main>
 
       {/* Footer */}
-      <footer className="bg-gray-800 text-white py-6 mt-12">
+      <footer className="bg-gray-800 text-white py-6">
         <div className="container mx-auto px-4 text-center">
           <p className="text-sm">
-            © 2024 Thapar Institute of Engineering & Technology
+            © 2025 Thapar Institute of Engineering & Technology
           </p>
           <p className="text-xs text-gray-400 mt-2">
             MultiModal Emotion Detection System | Machine Learning Project
