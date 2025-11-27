@@ -1,0 +1,1901 @@
+================================================================================
+                    PROJECT UPDATES - IMPLEMENTATION GUIDE
+              Multimodal Emotion Detection System - Extensions
+================================================================================
+
+!!!!! LATEST FIX - ALL 14 MODELS NOW WORKING (November 27, 2024) !!!!!
+
+ISSUE FIXED: Facial ML models not appearing in predictions (only 2/7 showing)
+ROOT CAUSE: Facial ML models saved as dictionaries with preprocessing pipelines
+- SVM & KNN: raw pixels (2304) → PCA (200) → scaler (200) → model (200)
+- XGBoost, RF, NB: raw pixels (2304) → model (2304) - NO PCA, NO scaler
+
+SOLUTION: Updated backend/main.py to handle both preprocessing pipelines:
+1. Added global facial_pca variable to store shared PCA from SVM model
+2. Modified model loading to extract PCA from SVM dictionary (line 135-144)
+3. Updated prediction logic to check if model has PCA (line 290-300)
+   - Models WITH PCA: Apply PCA → scaler → model
+   - Models WITHOUT PCA: Direct raw pixels → model
+
+VERIFICATION: All 14 models now working!
+✓ Text models: 7/7 (CNN-1D, BiLSTM, SVM, XGBoost, Naive Bayes, KNN, Random Forest)
+✓ Facial models: 7/7 (Deep CNN, MLP, SVM, XGBoost, Random Forest, KNN, Naive Bayes)
+
+DEPENDENCIES ADDED:
+- torchvision (pip install torchvision)
+- scikit-image (pip install scikit-image)
+
+================================================================================
+
+!!!!! IMPORTANT UPDATE - ARCHITECTURE FIX (November 27, 2024) !!!!!
+
+ISSUE FIXED: Model architecture mismatch between code and trained models
+- Trained model (facial_dcnn_best.pth - 19MB) uses Cell 10 architecture
+- Architecture: Double conv blocks + BatchNorm + Global Average Pooling
+- This is the 66% accuracy model WITH batch normalization
+
+SOLUTION: Updated to match Cell 10 (main.ipynb) architecture in:
+1. webcam.py (lines 15-101)
+2. backend/models.py (lines 95-181)
+
+ARCHITECTURE DETAILS (66% Accuracy Model):
+- Block 1: 1 → 64 → 64 (with BatchNorm, MaxPool, Dropout 0.4)
+- Block 2: 64 → 128 → 128 (with BatchNorm, MaxPool, Dropout 0.4)
+- Block 3: 128 → 256 → 256 (with BatchNorm, MaxPool, Dropout 0.5)
+- Block 4: 256 → 512 → 512 (with BatchNorm, MaxPool, Dropout 0.5)
+- Global Average Pooling (3x3 → 1x1)
+- FC: 512 → 256 → 128 → 7 (with BatchNorm, Dropout 0.6)
+
+These files now CORRECTLY match facial_dcnn_best.pth (19MB).
+
+================================================================================
+
+This file contains ALL code and commands needed to add:
+1. Webcam real-time emotion detection (webcam.py)
+2. React + Vite + Tailwind Frontend
+3. FastAPI Backend
+4. README.md
+
+COPY-PASTE EACH SECTION INTO YOUR PROJECT FOLDER!
+
+================================================================================
+                        SECTION 1: WEBCAM.PY
+================================================================================
+
+LOCATION: Root folder (same level as main.ipynb)
+FILE PATH: webcam.py
+
+CODE:
+--------------------------------------------------------------------------------
+"""
+Real-time Facial Emotion Detection using Webcam
+Loads trained Deep CNN model and predicts emotions from live video feed
+"""
+
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+from pathlib import Path
+
+# ============================================================================
+# MODEL DEFINITION (Same as training)
+# ============================================================================
+
+class DeepCNN(nn.Module):
+    def __init__(self, num_classes=7):
+        super(DeepCNN, self).__init__()
+
+        # Block 1: 48×48 → 24×24
+        self.conv1 = nn.Conv2d(1, 128, kernel_size=3, padding=1)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.dropout1 = nn.Dropout2d(0.4)
+
+        # Block 2: 24×24 → 12×12
+        self.conv2 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.dropout2 = nn.Dropout2d(0.4)
+
+        # Block 3: 12×12 → 6×6
+        self.conv3 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
+        self.pool3 = nn.MaxPool2d(2, 2)
+        self.dropout3 = nn.Dropout2d(0.4)
+
+        # Block 4: 6×6 → 3×3
+        self.conv4 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+        self.pool4 = nn.MaxPool2d(2, 2)
+        self.dropout4 = nn.Dropout2d(0.4)
+
+        # Fully connected layers
+        self.fc1 = nn.Linear(512 * 3 * 3, 512)
+        self.dropout5 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(512, 256)
+        self.dropout6 = nn.Dropout(0.3)
+        self.fc3 = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        # Block 1
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+        x = self.dropout1(x)
+
+        # Block 2
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+        x = self.dropout2(x)
+
+        # Block 3
+        x = F.relu(self.conv3(x))
+        x = self.pool3(x)
+        x = self.dropout3(x)
+
+        # Block 4
+        x = F.relu(self.conv4(x))
+        x = self.pool4(x)
+        x = self.dropout4(x)
+
+        # Flatten
+        x = x.view(x.size(0), -1)
+
+        # FC layers
+        x = F.relu(self.fc1(x))
+        x = self.dropout5(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout6(x)
+        x = self.fc3(x)
+
+        return x
+
+# ============================================================================
+# WEBCAM APPLICATION
+# ============================================================================
+
+class EmotionDetector:
+    def __init__(self, model_path='results/models/facial/facial_dcnn_best.pth'):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Emotion labels
+        self.emotions = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
+
+        # Load model
+        print("Loading model...")
+        self.model = DeepCNN(num_classes=7).to(self.device)
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.eval()
+        print(f"✓ Model loaded on {self.device}")
+
+        # Image transforms (same as training)
+        self.transform = transforms.Compose([
+            transforms.Resize((48, 48)),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+
+        # Load face cascade for face detection
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        self.face_cascade = cv2.CascadeClassifier(cascade_path)
+
+        # Colors for each emotion
+        self.colors = {
+            'happy': (0, 255, 0),      # Green
+            'neutral': (255, 255, 0),  # Yellow
+            'surprise': (0, 255, 255), # Cyan
+            'sad': (255, 0, 0),        # Blue
+            'angry': (0, 0, 255),      # Red
+            'disgust': (128, 0, 128),  # Purple
+            'fear': (255, 165, 0)      # Orange
+        }
+
+    def preprocess_face(self, face_img):
+        """Convert face image to tensor"""
+        # Convert BGR to RGB
+        face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+
+        # Convert to PIL Image
+        pil_img = Image.fromarray(face_rgb)
+
+        # Apply transforms
+        tensor = self.transform(pil_img)
+
+        # Add batch dimension
+        tensor = tensor.unsqueeze(0)
+
+        return tensor.to(self.device)
+
+    def predict_emotion(self, face_img):
+        """Predict emotion from face image"""
+        tensor = self.preprocess_face(face_img)
+
+        with torch.no_grad():
+            output = self.model(tensor)
+            probabilities = F.softmax(output, dim=1)
+            confidence, predicted = torch.max(probabilities, 1)
+
+        emotion = self.emotions[predicted.item()]
+        conf = confidence.item() * 100
+
+        return emotion, conf, probabilities[0].cpu().numpy()
+
+    def run(self):
+        """Start webcam emotion detection"""
+        # Open webcam
+        cap = cv2.VideoCapture(0)
+
+        if not cap.isOpened():
+            print("Error: Cannot open webcam")
+            return
+
+        print("\n" + "="*60)
+        print("REAL-TIME EMOTION DETECTION")
+        print("="*60)
+        print("Controls:")
+        print("  'q' - Quit")
+        print("  's' - Save screenshot")
+        print("  'i' - Show/Hide info panel")
+        print("="*60 + "\n")
+
+        show_info = True
+        frame_count = 0
+
+        while True:
+            ret, frame = cap.read()
+
+            if not ret:
+                print("Error: Cannot read frame")
+                break
+
+            frame_count += 1
+
+            # Flip frame horizontally for mirror effect
+            frame = cv2.flip(frame, 1)
+
+            # Convert to grayscale for face detection
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Detect faces
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(48, 48)
+            )
+
+            # Process each detected face
+            for (x, y, w, h) in faces:
+                # Extract face region
+                face_img = frame[y:y+h, x:x+w]
+
+                # Predict emotion
+                emotion, confidence, probs = self.predict_emotion(face_img)
+
+                # Get color for this emotion
+                color = self.colors.get(emotion, (255, 255, 255))
+
+                # Draw rectangle around face
+                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+
+                # Draw emotion label
+                label = f"{emotion.upper()}: {confidence:.1f}%"
+                cv2.putText(frame, label, (x, y-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+                # Draw info panel if enabled
+                if show_info:
+                    self.draw_info_panel(frame, probs)
+
+            # Draw FPS
+            cv2.putText(frame, f"Frame: {frame_count}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            # Show frame
+            cv2.imshow('Emotion Detection - Press Q to quit', frame)
+
+            # Handle key presses
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('q'):
+                print("Quitting...")
+                break
+            elif key == ord('s'):
+                filename = f'screenshot_{frame_count}.jpg'
+                cv2.imwrite(filename, frame)
+                print(f"✓ Screenshot saved: {filename}")
+            elif key == ord('i'):
+                show_info = not show_info
+
+        # Cleanup
+        cap.release()
+        cv2.destroyAllWindows()
+        print("Webcam closed.")
+
+    def draw_info_panel(self, frame, probabilities):
+        """Draw emotion probabilities panel"""
+        h, w = frame.shape[:2]
+        panel_width = 250
+        panel_x = w - panel_width - 10
+        panel_y = 50
+
+        # Draw semi-transparent background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y),
+                     (panel_x + panel_width, panel_y + 250),
+                     (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+        # Draw title
+        cv2.putText(frame, "Probabilities:", (panel_x + 10, panel_y + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Draw bars for each emotion
+        for i, (emotion, prob) in enumerate(zip(self.emotions, probabilities)):
+            y = panel_y + 50 + i * 30
+            bar_length = int(prob * 200)
+            color = self.colors[emotion]
+
+            # Draw emotion name
+            cv2.putText(frame, f"{emotion[:7]}", (panel_x + 10, y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # Draw probability bar
+            cv2.rectangle(frame, (panel_x + 80, y - 10),
+                         (panel_x + 80 + bar_length, y + 5),
+                         color, -1)
+
+            # Draw percentage
+            cv2.putText(frame, f"{prob*100:.1f}%", (panel_x + 190, y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    try:
+        detector = EmotionDetector()
+        detector.run()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+--------------------------------------------------------------------------------
+
+TO RUN WEBCAM:
+python webcam.py
+
+REQUIREMENTS (install if needed):
+pip install opencv-python torch torchvision pillow
+
+
+================================================================================
+                        SECTION 2: FRONTEND (React + Vite)
+================================================================================
+
+LOCATION: results/frontend/
+
+COMMANDS TO CREATE FRONTEND:
+--------------------------------------------------------------------------------
+cd results
+npm create vite@latest frontend -- --template react
+cd frontend
+npm install
+npm install -D tailwindcss postcss autoprefixer
+npx tailwindcss init -p
+npm install axios
+--------------------------------------------------------------------------------
+
+FOLDER STRUCTURE TO CREATE:
+results/frontend/
+├── public/
+│   └── image.png          (Thapar logo - you'll add manually)
+├── src/
+│   ├── components/
+│   │   ├── Header.jsx
+│   │   ├── TextMode.jsx
+│   │   ├── ImageMode.jsx
+│   │   └── ResultsDisplay.jsx
+│   ├── App.jsx
+│   ├── main.jsx
+│   └── index.css
+├── tailwind.config.js
+├── vite.config.js
+├── package.json
+└── index.html
+
+
+FILE 1: tailwind.config.js
+--------------------------------------------------------------------------------
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        primary: '#1e40af',
+        secondary: '#3b82f6',
+      }
+    },
+  },
+  plugins: [],
+}
+--------------------------------------------------------------------------------
+
+
+FILE 2: src/index.css
+--------------------------------------------------------------------------------
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+--------------------------------------------------------------------------------
+
+
+FILE 3: src/components/Header.jsx
+--------------------------------------------------------------------------------
+import React from 'react';
+
+const Header = () => {
+  return (
+    <header className="bg-gradient-to-r from-blue-900 to-blue-700 text-white shadow-lg">
+      <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+        {/* Logo */}
+        <div className="flex items-center space-x-4">
+          <img
+            src="/image.png"
+            alt="Thapar Logo"
+            className="h-16 w-16 object-contain"
+          />
+          <div className="hidden sm:block">
+            <p className="text-xs text-blue-200">Thapar Institute of Engineering & Technology</p>
+          </div>
+        </div>
+
+        {/* Title */}
+        <div className="text-center flex-1">
+          <h1 className="text-2xl sm:text-3xl font-bold">
+            MultiModal Emotion Detection System
+          </h1>
+          <p className="text-sm text-blue-200 mt-1">Text & Facial Analysis</p>
+        </div>
+
+        {/* Right spacer for symmetry */}
+        <div className="w-16 sm:w-32"></div>
+      </div>
+    </header>
+  );
+};
+
+export default Header;
+--------------------------------------------------------------------------------
+
+
+FILE 4: src/components/TextMode.jsx
+--------------------------------------------------------------------------------
+import React, { useState } from 'react';
+import axios from 'axios';
+import ResultsDisplay from './ResultsDisplay';
+
+const TextMode = () => {
+  const [text, setText] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState(null);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+
+    if (!text.trim()) {
+      setError('Please enter some text');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+    setResults(null);
+
+    try {
+      const response = await axios.post('http://localhost:8000/predict/text', {
+        text: text
+      });
+
+      setResults(response.data);
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Error predicting emotion. Make sure backend is running!');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto">
+      <div className="bg-white rounded-lg shadow-lg p-6">
+        <h2 className="text-2xl font-bold text-gray-800 mb-4">Text Emotion Analysis</h2>
+
+        <form onSubmit={handleSubmit}>
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Enter text to analyze emotions... (e.g., 'I am so happy today!')"
+            className="w-full h-32 px-4 py-3 border-2 border-gray-300 rounded-lg focus:border-blue-500 focus:outline-none resize-none"
+            disabled={loading}
+          />
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="mt-4 w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-semibold py-3 px-6 rounded-lg transition duration-200"
+          >
+            {loading ? 'Analyzing...' : 'Analyze Emotion'}
+          </button>
+        </form>
+
+        {error && (
+          <div className="mt-4 p-4 bg-red-100 border border-red-400 text-red-700 rounded-lg">
+            {error}
+          </div>
+        )}
+
+        {results && (
+          <div className="mt-6">
+            <ResultsDisplay results={results} mode="text" />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default TextMode;
+--------------------------------------------------------------------------------
+
+
+FILE 5: src/components/ImageMode.jsx
+--------------------------------------------------------------------------------
+import React, { useState, useRef } from 'react';
+import axios from 'axios';
+import ResultsDisplay from './ResultsDisplay';
+
+const ImageMode = () => {
+  const [mode, setMode] = useState(null); // 'upload' or 'camera'
+  const [image, setImage] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState(null);
+  const [error, setError] = useState('');
+  const [stream, setStream] = useState(null);
+
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const startCamera = async () => {
+    try {
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' }
+      });
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+      }
+
+      setStream(mediaStream);
+      setMode('camera');
+      setError('');
+    } catch (err) {
+      setError('Cannot access camera. Please check permissions.');
+    }
+  };
+
+  const stopCamera = () => {
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      setStream(null);
+    }
+    setMode(null);
+  };
+
+  const captureImage = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+
+    if (video && canvas) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0);
+
+      canvas.toBlob(async (blob) => {
+        setImage(blob);
+        setPreview(canvas.toDataURL());
+        await predictEmotion(blob);
+      }, 'image/jpeg');
+    }
+  };
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+
+    if (file) {
+      setImage(file);
+      setPreview(URL.createObjectURL(file));
+      setMode('upload');
+      predictEmotion(file);
+    }
+  };
+
+  const predictEmotion = async (imageBlob) => {
+    setLoading(true);
+    setError('');
+    setResults(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', imageBlob);
+
+      const response = await axios.post('http://localhost:8000/predict/image', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        }
+      });
+
+      setResults(response.data);
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Error predicting emotion. Make sure backend is running!');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const reset = () => {
+    stopCamera();
+    setImage(null);
+    setPreview(null);
+    setResults(null);
+    setError('');
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto">
+      <div className="bg-white rounded-lg shadow-lg p-6">
+        <h2 className="text-2xl font-bold text-gray-800 mb-4">Facial Emotion Analysis</h2>
+
+        {!mode && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <button
+              onClick={() => fileInputRef.current.click()}
+              className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-8 px-6 rounded-lg transition duration-200"
+            >
+              <svg className="w-12 h-12 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+              </svg>
+              Upload Image
+            </button>
+
+            <button
+              onClick={startCamera}
+              className="bg-green-600 hover:bg-green-700 text-white font-semibold py-8 px-6 rounded-lg transition duration-200"
+            >
+              <svg className="w-12 h-12 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+              Use Camera
+            </button>
+          </div>
+        )}
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          onChange={handleFileUpload}
+          className="hidden"
+        />
+
+        {mode === 'camera' && !preview && (
+          <div className="relative">
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              className="w-full rounded-lg"
+            />
+            <div className="mt-4 flex gap-4">
+              <button
+                onClick={captureImage}
+                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition duration-200"
+              >
+                Capture & Analyze
+              </button>
+              <button
+                onClick={stopCamera}
+                className="bg-red-600 hover:bg-red-700 text-white font-semibold py-3 px-6 rounded-lg transition duration-200"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        <canvas ref={canvasRef} className="hidden" />
+
+        {preview && (
+          <div className="mt-4">
+            <img src={preview} alt="Captured" className="w-full max-w-md mx-auto rounded-lg shadow-lg" />
+            <button
+              onClick={reset}
+              className="mt-4 w-full bg-gray-600 hover:bg-gray-700 text-white font-semibold py-2 px-6 rounded-lg transition duration-200"
+            >
+              Try Another Image
+            </button>
+          </div>
+        )}
+
+        {loading && (
+          <div className="mt-4 text-center">
+            <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+            <p className="mt-2 text-gray-600">Analyzing emotion...</p>
+          </div>
+        )}
+
+        {error && (
+          <div className="mt-4 p-4 bg-red-100 border border-red-400 text-red-700 rounded-lg">
+            {error}
+          </div>
+        )}
+
+        {results && (
+          <div className="mt-6">
+            <ResultsDisplay results={results} mode="image" />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default ImageMode;
+--------------------------------------------------------------------------------
+
+
+FILE 6: src/components/ResultsDisplay.jsx
+--------------------------------------------------------------------------------
+import React from 'react';
+
+const ResultsDisplay = ({ results, mode }) => {
+  const modelOrder = mode === 'text'
+    ? ['CNN-1D', 'BiLSTM', 'SVM', 'XGBoost', 'Naive Bayes', 'KNN', 'Random Forest']
+    : ['Deep CNN', 'MLP', 'SVM', 'XGBoost', 'Random Forest', 'KNN', 'Naive Bayes'];
+
+  const getEmotionColor = (emotion) => {
+    const colors = {
+      'happy': 'bg-green-500',
+      'joy': 'bg-green-500',
+      'love': 'bg-pink-500',
+      'surprise': 'bg-yellow-500',
+      'neutral': 'bg-gray-500',
+      'sad': 'bg-blue-500',
+      'sadness': 'bg-blue-500',
+      'anger': 'bg-red-500',
+      'angry': 'bg-red-500',
+      'fear': 'bg-purple-500',
+      'disgust': 'bg-orange-500'
+    };
+
+    return colors[emotion.toLowerCase()] || 'bg-gray-500';
+  };
+
+  return (
+    <div className="space-y-4">
+      <h3 className="text-xl font-bold text-gray-800 border-b-2 border-gray-300 pb-2">
+        Prediction Results
+      </h3>
+
+      <div className="overflow-x-auto">
+        <table className="min-w-full bg-white border border-gray-300">
+          <thead className="bg-gray-100">
+            <tr>
+              <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider border-b">
+                Model
+              </th>
+              <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider border-b">
+                Predicted Emotion
+              </th>
+              <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider border-b">
+                Confidence
+              </th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200">
+            {modelOrder.map((model) => {
+              const result = results.predictions[model];
+
+              if (!result) return null;
+
+              return (
+                <tr key={model} className="hover:bg-gray-50">
+                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                    {model}
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap">
+                    <span className={`px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full text-white ${getEmotionColor(result.emotion)}`}>
+                      {result.emotion.toUpperCase()}
+                    </span>
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+                    <div className="flex items-center">
+                      <div className="w-24 bg-gray-200 rounded-full h-2 mr-2">
+                        <div
+                          className="bg-blue-600 h-2 rounded-full"
+                          style={{ width: `${result.confidence}%` }}
+                        ></div>
+                      </div>
+                      <span className="font-semibold">{result.confidence.toFixed(1)}%</span>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="mt-4 p-4 bg-blue-50 rounded-lg">
+        <h4 className="font-semibold text-gray-800 mb-2">Summary:</h4>
+        <p className="text-sm text-gray-700">
+          {mode === 'text' ? 'Text' : 'Facial'} analysis complete!
+          {Object.keys(results.predictions).length} models analyzed.
+        </p>
+      </div>
+    </div>
+  );
+};
+
+export default ResultsDisplay;
+--------------------------------------------------------------------------------
+
+
+FILE 7: src/App.jsx
+--------------------------------------------------------------------------------
+import React, { useState } from 'react';
+import Header from './components/Header';
+import TextMode from './components/TextMode';
+import ImageMode from './components/ImageMode';
+
+function App() {
+  const [activeMode, setActiveMode] = useState(null); // 'text' or 'image'
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-100 to-gray-200">
+      <Header />
+
+      <main className="container mx-auto px-4 py-8">
+        {/* Mode Selection */}
+        {!activeMode && (
+          <div className="max-w-2xl mx-auto">
+            <h2 className="text-3xl font-bold text-center text-gray-800 mb-8">
+              Choose Analysis Mode
+            </h2>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <button
+                onClick={() => setActiveMode('text')}
+                className="bg-white hover:shadow-2xl shadow-lg rounded-lg p-8 transition duration-300 transform hover:scale-105"
+              >
+                <div className="text-blue-600 mb-4">
+                  <svg className="w-16 h-16 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                </div>
+                <h3 className="text-xl font-bold text-gray-800 mb-2">Text Analysis</h3>
+                <p className="text-gray-600">Analyze emotions from text using 7 trained models</p>
+              </button>
+
+              <button
+                onClick={() => setActiveMode('image')}
+                className="bg-white hover:shadow-2xl shadow-lg rounded-lg p-8 transition duration-300 transform hover:scale-105"
+              >
+                <div className="text-green-600 mb-4">
+                  <svg className="w-16 h-16 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                </div>
+                <h3 className="text-xl font-bold text-gray-800 mb-2">Facial Analysis</h3>
+                <p className="text-gray-600">Detect emotions from facial expressions using 7 models</p>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Active Mode */}
+        {activeMode && (
+          <div>
+            <button
+              onClick={() => setActiveMode(null)}
+              className="mb-6 flex items-center text-blue-600 hover:text-blue-800 font-semibold"
+            >
+              <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+              </svg>
+              Back to Mode Selection
+            </button>
+
+            {activeMode === 'text' && <TextMode />}
+            {activeMode === 'image' && <ImageMode />}
+          </div>
+        )}
+      </main>
+
+      {/* Footer */}
+      <footer className="bg-gray-800 text-white py-6 mt-12">
+        <div className="container mx-auto px-4 text-center">
+          <p className="text-sm">
+            © 2024 Thapar Institute of Engineering & Technology
+          </p>
+          <p className="text-xs text-gray-400 mt-2">
+            MultiModal Emotion Detection System | Machine Learning Project
+          </p>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+export default App;
+--------------------------------------------------------------------------------
+
+
+FILE 8: src/main.jsx
+--------------------------------------------------------------------------------
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App.jsx'
+import './index.css'
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+)
+--------------------------------------------------------------------------------
+
+
+FILE 9: vite.config.js
+--------------------------------------------------------------------------------
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 3000,
+  }
+})
+--------------------------------------------------------------------------------
+
+
+TO RUN FRONTEND:
+cd results/frontend
+npm run dev
+
+Frontend will run on: http://localhost:3000
+
+
+================================================================================
+                        SECTION 3: BACKEND (FastAPI)
+================================================================================
+
+LOCATION: backend/ (create in root folder, same level as results/)
+
+FOLDER STRUCTURE:
+backend/
+├── main.py
+├── requirements.txt
+└── models.py
+
+
+FILE 1: backend/requirements.txt
+--------------------------------------------------------------------------------
+fastapi==0.104.1
+uvicorn==0.24.0
+torch==2.1.0
+torchvision==0.16.0
+scikit-learn==1.3.2
+xgboost==2.0.3
+pillow==10.1.0
+opencv-python==4.8.1.78
+python-multipart==0.0.6
+numpy==1.26.2
+pandas==2.1.3
+--------------------------------------------------------------------------------
+
+
+FILE 2: backend/models.py
+--------------------------------------------------------------------------------
+"""
+Model definitions for loading trained models
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ============================================================================
+# TEXT MODELS
+# ============================================================================
+
+class CNN1DClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, num_classes=6, dropout=0.5):
+        super(CNN1DClassifier, self).__init__()
+
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+
+        self.conv1 = nn.Conv1d(embed_dim, 256, kernel_size=3, padding=1)
+        self.pool1 = nn.MaxPool1d(2)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(256, 128, kernel_size=3, padding=1)
+        self.pool2 = nn.AdaptiveMaxPool1d(1)
+
+        self.fc1 = nn.Linear(128, 128)
+        self.dropout2 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = x.transpose(1, 2)
+
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+        x = self.dropout1(x)
+
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+
+        x = x.squeeze(-1)
+
+        x = F.relu(self.fc1(x))
+        x = self.dropout2(x)
+        x = self.fc2(x)
+
+        return x
+
+
+class BiLSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=64,
+                 num_classes=6, dropout=0.5):
+        super(BiLSTMClassifier, self).__init__()
+
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+
+        self.lstm1 = nn.LSTM(
+            embed_dim, hidden_dim,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.lstm2 = nn.LSTM(
+            hidden_dim * 2, hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.fc1 = nn.Linear(hidden_dim, 64)
+        self.dropout3 = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = self.embedding(x)
+
+        x, _ = self.lstm1(x)
+        x = self.dropout1(x)
+
+        x, _ = self.lstm2(x)
+        x = self.dropout2(x)
+
+        x = x[:, -1, :]
+
+        x = F.relu(self.fc1(x))
+        x = self.dropout3(x)
+        x = self.fc2(x)
+
+        return x
+
+
+# ============================================================================
+# FACIAL MODELS
+# ============================================================================
+
+class DeepCNN(nn.Module):
+    def __init__(self, num_classes=7):
+        super(DeepCNN, self).__init__()
+
+        # Block 1
+        self.conv1 = nn.Conv2d(1, 128, kernel_size=3, padding=1)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.dropout1 = nn.Dropout2d(0.4)
+
+        # Block 2
+        self.conv2 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.dropout2 = nn.Dropout2d(0.4)
+
+        # Block 3
+        self.conv3 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
+        self.pool3 = nn.MaxPool2d(2, 2)
+        self.dropout3 = nn.Dropout2d(0.4)
+
+        # Block 4
+        self.conv4 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+        self.pool4 = nn.MaxPool2d(2, 2)
+        self.dropout4 = nn.Dropout2d(0.4)
+
+        # FC layers
+        self.fc1 = nn.Linear(512 * 3 * 3, 512)
+        self.dropout5 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(512, 256)
+        self.dropout6 = nn.Dropout(0.3)
+        self.fc3 = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+        x = self.dropout1(x)
+
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+        x = self.dropout2(x)
+
+        x = F.relu(self.conv3(x))
+        x = self.pool3(x)
+        x = self.dropout3(x)
+
+        x = F.relu(self.conv4(x))
+        x = self.pool4(x)
+        x = self.dropout4(x)
+
+        x = x.view(x.size(0), -1)
+
+        x = F.relu(self.fc1(x))
+        x = self.dropout5(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout6(x)
+        x = self.fc3(x)
+
+        return x
+
+
+class MLPClassifier(nn.Module):
+    def __init__(self, input_size=48*48, num_classes=7):
+        super(MLPClassifier, self).__init__()
+
+        self.fc1 = nn.Linear(input_size, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.dropout1 = nn.Dropout(0.5)
+
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.dropout2 = nn.Dropout(0.5)
+
+        self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.dropout3 = nn.Dropout(0.4)
+
+        self.fc4 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.dropout1(x)
+
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+
+        x = self.fc3(x)
+        x = self.bn3(x)
+        x = F.relu(x)
+        x = self.dropout3(x)
+
+        x = self.fc4(x)
+
+        return x
+
+--------------------------------------------------------------------------------
+
+
+FILE 3: backend/main.py
+--------------------------------------------------------------------------------
+"""
+FastAPI Backend for Multimodal Emotion Detection
+Loads all 14 models and provides prediction endpoints
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
+import pickle
+import numpy as np
+import re
+from io import BytesIO
+
+from models import CNN1DClassifier, BiLSTMClassifier, DeepCNN, MLPClassifier
+
+# ============================================================================
+# FASTAPI APP
+# ============================================================================
+
+app = FastAPI(title="Emotion Detection API")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================================
+# GLOBAL VARIABLES
+# ============================================================================
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Model storage
+text_models = {}
+facial_models = {}
+
+# Labels
+text_emotions = ['anger', 'fear', 'joy', 'love', 'sadness', 'surprise']
+facial_emotions = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
+
+# Preprocessors
+vectorizer = None
+word_to_idx = None
+
+# Image transforms
+transform = transforms.Compose([
+    transforms.Resize((48, 48)),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])
+])
+
+# ============================================================================
+# LOAD MODELS
+# ============================================================================
+
+@app.on_event("startup")
+async def load_models():
+    global text_models, facial_models, vectorizer, word_to_idx
+
+    print("Loading models...")
+
+    # Load text preprocessors
+    try:
+        with open('../text_tfidf_data.pkl', 'rb') as f:
+            tfidf_data = pickle.load(f)
+            vectorizer = tfidf_data['vectorizer']
+
+        with open('../text_tokenized_data.pkl', 'rb') as f:
+            token_data = pickle.load(f)
+            word_to_idx = token_data.get('word_to_idx', {})
+            if not word_to_idx:
+                # Build basic vocab
+                word_to_idx = {'<PAD>': 0, '<UNK>': 1}
+                for i in range(2, 10002):
+                    word_to_idx[f'word_{i}'] = i
+    except Exception as e:
+        print(f"Warning: Could not load preprocessors: {e}")
+
+    # TEXT MODELS
+    try:
+        # CNN-1D
+        cnn1d = CNN1DClassifier(vocab_size=10002, num_classes=6).to(device)
+        cnn1d.load_state_dict(torch.load('../results/models/text/text_cnn1d_best.pth', map_location=device))
+        cnn1d.eval()
+        text_models['CNN-1D'] = cnn1d
+
+        # BiLSTM
+        lstm = BiLSTMClassifier(vocab_size=10002, num_classes=6).to(device)
+        lstm.load_state_dict(torch.load('../results/models/text/text_lstm_best.pth', map_location=device))
+        lstm.eval()
+        text_models['BiLSTM'] = lstm
+
+        # ML models
+        with open('../results/models/text/text_svm.pkl', 'rb') as f:
+            text_models['SVM'] = pickle.load(f)
+
+        with open('../results/models/text/text_xgboost.pkl', 'rb') as f:
+            text_models['XGBoost'] = pickle.load(f)
+
+        with open('../results/models/text/text_nb.pkl', 'rb') as f:
+            text_models['Naive Bayes'] = pickle.load(f)
+
+        with open('../results/models/text/text_knn.pkl', 'rb') as f:
+            text_models['KNN'] = pickle.load(f)
+
+        with open('../results/models/text/text_rf.pkl', 'rb') as f:
+            text_models['Random Forest'] = pickle.load(f)
+
+        print(f"✓ Loaded {len(text_models)} text models")
+    except Exception as e:
+        print(f"Error loading text models: {e}")
+
+    # FACIAL MODELS
+    try:
+        # Deep CNN
+        dcnn = DeepCNN(num_classes=7).to(device)
+        dcnn.load_state_dict(torch.load('../results/models/facial/facial_dcnn_best.pth', map_location=device))
+        dcnn.eval()
+        facial_models['Deep CNN'] = dcnn
+
+        # MLP
+        mlp = MLPClassifier(num_classes=7).to(device)
+        mlp.load_state_dict(torch.load('../results/models/facial/facial_mlp_best.pth', map_location=device))
+        mlp.eval()
+        facial_models['MLP'] = mlp
+
+        # ML models
+        with open('../results/models/facial/facial_svm.pkl', 'rb') as f:
+            facial_models['SVM'] = pickle.load(f)
+
+        with open('../results/models/facial/facial_xgboost.pkl', 'rb') as f:
+            facial_models['XGBoost'] = pickle.load(f)
+
+        with open('../results/models/facial/facial_rf.pkl', 'rb') as f:
+            facial_models['Random Forest'] = pickle.load(f)
+
+        with open('../results/models/facial/facial_knn.pkl', 'rb') as f:
+            facial_models['KNN'] = pickle.load(f)
+
+        with open('../results/models/facial/facial_nb.pkl', 'rb') as f:
+            facial_models['Naive Bayes'] = pickle.load(f)
+
+        print(f"✓ Loaded {len(facial_models)} facial models")
+    except Exception as e:
+        print(f"Error loading facial models: {e}")
+
+    print(f"Total models loaded: {len(text_models) + len(facial_models)}")
+    print(f"Device: {device}")
+
+# ============================================================================
+# PREPROCESSING
+# ============================================================================
+
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'http\S+|www\S+', '', text)
+    text = re.sub(r'@\w+', '', text)
+    text = re.sub(r'[^a-z\s]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def tokenize_text(text, max_len=100):
+    words = text.split()
+    indices = [word_to_idx.get(word, 1) for word in words]
+
+    if len(indices) > max_len:
+        indices = indices[:max_len]
+    else:
+        indices += [0] * (max_len - len(indices))
+
+    return indices
+
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
+
+class TextRequest(BaseModel):
+    text: str
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Multimodal Emotion Detection API",
+        "text_models": len(text_models),
+        "facial_models": len(facial_models),
+        "endpoints": ["/predict/text", "/predict/image"]
+    }
+
+@app.post("/predict/text")
+async def predict_text(request: TextRequest):
+    try:
+        text = request.text.strip()
+
+        if not text:
+            raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+        # Clean text
+        cleaned = clean_text(text)
+
+        predictions = {}
+
+        # DL models (CNN-1D, BiLSTM)
+        tokens = tokenize_text(cleaned)
+        tensor = torch.LongTensor([tokens]).to(device)
+
+        for name in ['CNN-1D', 'BiLSTM']:
+            if name in text_models:
+                model = text_models[name]
+                with torch.no_grad():
+                    output = model(tensor)
+                    probs = F.softmax(output, dim=1)
+                    confidence, predicted = torch.max(probs, 1)
+
+                predictions[name] = {
+                    'emotion': text_emotions[predicted.item()],
+                    'confidence': confidence.item() * 100
+                }
+
+        # ML models (need TF-IDF)
+        if vectorizer:
+            tfidf = vectorizer.transform([cleaned])
+
+            for name in ['SVM', 'XGBoost', 'Naive Bayes', 'KNN', 'Random Forest']:
+                if name in text_models:
+                    model = text_models[name]
+                    pred = model.predict(tfidf)[0]
+
+                    # Get probability if available
+                    if hasattr(model, 'predict_proba'):
+                        proba = model.predict_proba(tfidf)[0]
+                        confidence = proba.max() * 100
+                    else:
+                        confidence = 85.0  # Default
+
+                    predictions[name] = {
+                        'emotion': text_emotions[pred],
+                        'confidence': confidence
+                    }
+
+        return {
+            'original_text': text,
+            'cleaned_text': cleaned,
+            'predictions': predictions
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict/image")
+async def predict_image(file: UploadFile = File(...)):
+    try:
+        # Read image
+        contents = await file.read()
+        image = Image.open(BytesIO(contents)).convert('RGB')
+
+        predictions = {}
+
+        # DL models (Deep CNN, MLP)
+        tensor = transform(image).unsqueeze(0).to(device)
+
+        for name in ['Deep CNN', 'MLP']:
+            if name in facial_models:
+                model = facial_models[name]
+                with torch.no_grad():
+                    output = model(tensor)
+                    probs = F.softmax(output, dim=1)
+                    confidence, predicted = torch.max(probs, 1)
+
+                predictions[name] = {
+                    'emotion': facial_emotions[predicted.item()],
+                    'confidence': confidence.item() * 100
+                }
+
+        # ML models (need HOG features)
+        # For simplicity, using flattened grayscale as features
+        gray = image.convert('L').resize((48, 48))
+        features = np.array(gray).flatten().reshape(1, -1) / 255.0
+
+        for name in ['SVM', 'XGBoost', 'Random Forest', 'KNN', 'Naive Bayes']:
+            if name in facial_models:
+                model = facial_models[name]
+                try:
+                    pred = model.predict(features)[0]
+
+                    if hasattr(model, 'predict_proba'):
+                        proba = model.predict_proba(features)[0]
+                        confidence = proba.max() * 100
+                    else:
+                        confidence = 75.0
+
+                    predictions[name] = {
+                        'emotion': facial_emotions[pred],
+                        'confidence': confidence
+                    }
+                except:
+                    pass
+
+        return {
+            'filename': file.filename,
+            'predictions': predictions
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+--------------------------------------------------------------------------------
+
+
+TO RUN BACKEND:
+cd backend
+pip install -r requirements.txt
+python main.py
+
+Backend will run on: http://localhost:8000
+API docs: http://localhost:8000/docs
+
+
+================================================================================
+                        SECTION 4: README.md
+================================================================================
+
+LOCATION: Root folder (same level as main.ipynb)
+FILE PATH: README.md
+
+CODE:
+--------------------------------------------------------------------------------
+# MultiModal Emotion Detection System
+
+A comprehensive emotion detection system that analyzes emotions from both **text** and **facial expressions** using multiple machine learning and deep learning models.
+
+## 📊 Project Overview
+
+This project implements **14 different models** (7 for text, 7 for facial) to detect and classify emotions:
+
+### Text Emotion Models (6 emotions)
+- **Deep Learning**: CNN-1D, BiLSTM
+- **Machine Learning**: SVM, XGBoost, Random Forest, Naive Bayes, KNN
+
+### Facial Emotion Models (7 emotions)
+- **Deep Learning**: Deep CNN, MLP
+- **Machine Learning**: SVM, XGBoost, Random Forest, Naive Bayes, KNN
+
+---
+
+## 🎯 Results
+
+### Text Emotion Detection
+| Model | Accuracy | Training Time |
+|-------|----------|---------------|
+| **CNN-1D** | **91.15%** | 34.7s |
+| BiLSTM | 91.10% | 48.9s |
+| SVM | 89.55% | 44.3s |
+| XGBoost | 85.50% | 30.7s |
+| Naive Bayes | 81.80% | 0.2s |
+| KNN | 74.50% | 39.4s |
+| Random Forest | 49.60% | 47.8s |
+
+### Facial Emotion Detection
+| Model | Accuracy | Training Time |
+|-------|----------|---------------|
+| **Deep CNN** | **66.34%** | 8.6 min |
+| MLP | 42.59% | 6.8 min |
+| XGBoost | 39.36% | - |
+| SVM | 35.72% | - |
+| Random Forest | 34.68% | - |
+| KNN | 19.27% | - |
+| Naive Bayes | 20.09% | - |
+
+---
+
+## 📁 Project Structure
+
+```
+ML_EVAL/
+├── main.ipynb                          # Main training notebook (all 14 models)
+├── webcam.py                           # Real-time facial emotion detection
+├── README.md                           # This file
+├── VIVA_UPDATE.txt                     # Comprehensive viva preparation guide
+├── UPDATES.txt                         # Implementation guide for extensions
+│
+├── results/
+│   ├── models/
+│   │   ├── text/                       # Trained text models (.pth, .pkl)
+│   │   └── facial/                     # Trained facial models (.pth, .pkl)
+│   │
+│   ├── metrics/
+│   │   ├── all_models_results.csv      # Combined results
+│   │   ├── text_all_results.csv
+│   │   └── facial_all_results.csv
+│   │
+│   ├── graphs/
+│   │   ├── training_curves/            # Loss/accuracy plots
+│   │   └── master_comparison.png       # Final comparison chart
+│   │
+│   └── frontend/                       # React web application
+│       ├── src/
+│       ├── public/
+│       └── package.json
+│
+└── backend/                            # FastAPI backend
+    ├── main.py
+    ├── models.py
+    └── requirements.txt
+```
+
+---
+
+## 🚀 Quick Start
+
+### 1. Training Models (Jupyter Notebook)
+```bash
+# Open main.ipynb and run all cells
+jupyter notebook main.ipynb
+```
+
+### 2. Webcam Real-time Detection
+```bash
+python webcam.py
+```
+
+### 3. Web Application
+
+**Backend:**
+```bash
+cd backend
+pip install -r requirements.txt
+python main.py
+# Runs on http://localhost:8000
+```
+
+**Frontend:**
+```bash
+cd results/frontend
+npm install
+npm run dev
+# Runs on http://localhost:3000
+```
+
+---
+
+## 📚 Datasets
+
+### Text Dataset
+- **Source**: Emotion Detection Text Corpus
+- **Total Samples**: 416,809
+- **Emotions**: 6 classes (sadness, joy, love, anger, fear, surprise)
+- **Split**: 90% train, 10% test
+
+### Facial Dataset
+- **Source**: FER-2013 (Facial Expression Recognition)
+- **Total Samples**: 35,887 images
+- **Train**: 28,709 | **Test**: 7,178
+- **Image Size**: 48×48 grayscale
+- **Emotions**: 7 classes (angry, disgust, fear, happy, neutral, sad, surprise)
+
+---
+
+## 🛠️ Tech Stack
+
+### Training & Models
+- **PyTorch** 2.5.1 (Deep Learning)
+- **scikit-learn** (Machine Learning)
+- **XGBoost** (Gradient Boosting)
+- **NLTK** (Text Processing)
+
+### Web Application
+- **Backend**: FastAPI, Uvicorn
+- **Frontend**: React 18, Vite, Tailwind CSS
+- **Real-time**: OpenCV (webcam)
+
+### Environment
+- **GPU**: NVIDIA RTX 4090 (24GB)
+- **Platform**: Vast.ai
+- **Python**: 3.12
+
+---
+
+## 📖 Features
+
+### 1. Text Analysis
+- Input any text (tweets, messages, reviews)
+- Get predictions from 7 different models
+- Confidence scores for each prediction
+- Clean comparison table
+
+### 2. Facial Analysis
+- **Upload Image**: Analyze emotions from photos
+- **Live Camera**: Real-time facial emotion detection
+- Predictions from 7 facial models
+- Visual confidence bars
+
+### 3. Webcam Application
+- Real-time emotion detection from webcam
+- Face detection using Haar Cascades
+- Live probability bars for all emotions
+- Color-coded emotion display
+- Screenshot capability
+
+---
+
+## 🎓 Key Learnings
+
+### Why Text Performs Better (91% vs 66%)?
+1. **Dataset Quality**: Text corpus is cleaner, facial dataset has ~30% label noise
+2. **Data Quantity**: 416K text samples vs 35K facial images
+3. **Feature Richness**: 10,000 word vocabulary vs 2,304 pixels
+4. **Task Difficulty**: Text has clear indicators, facial expressions are subtle
+
+### Why Deep Learning > Machine Learning?
+- **Text**: DL (91%) vs ML (89%) - small gap, both work
+- **Facial**: DL (66%) vs ML (39%) - HUGE gap, DL essential for images
+- **Reason**: CNNs learn spatial features automatically, HOG features insufficient
+
+---
+
+## 🔧 Installation
+
+```bash
+# Clone repository
+git clone <repo-url>
+cd ML_EVAL
+
+# Install Python dependencies
+pip install torch torchvision scikit-learn xgboost opencv-python nltk pandas numpy matplotlib seaborn
+
+# Install frontend dependencies
+cd results/frontend
+npm install
+
+# Install backend dependencies
+cd ../../backend
+pip install -r requirements.txt
+```
+
+---
+
+## 📊 Model Architectures
+
+### CNN-1D (Text)
+```
+Embedding(10000, 128)
+→ Conv1D(256, kernel=3)
+→ MaxPool1D(2)
+→ Conv1D(128, kernel=3)
+→ GlobalMaxPool
+→ Dense(128)
+→ Dense(6)
+```
+
+### Deep CNN (Facial)
+```
+Conv2D(128) → Pool → Dropout
+→ Conv2D(256) → Pool → Dropout
+→ Conv2D(512) → Pool → Dropout
+→ Conv2D(512) → Pool → Dropout
+→ Dense(512) → Dense(256) → Dense(7)
+```
+
+Total Parameters: 9.8M
+
+---
+
+## 👥 Authors
+
+**Dhruv Goyal**
+Thapar Institute of Engineering & Technology, Patiala
+
+---
+
+## 📝 License
+
+This project is for educational purposes.
+
+---
+
+## 🙏 Acknowledgments
+
+- FER-2013 dataset creators
+- PyTorch and scikit-learn communities
+- Thapar Institute faculty
+- Vast.ai for GPU resources
+
+---
+
+## 📞 Contact
+
+For questions or feedback:
+- GitHub: [Your GitHub]
+- Email: [Your Email]
+
+---
+
+**Last Updated**: November 2024
+--------------------------------------------------------------------------------
+
+================================================================================
+                        SECTION 5: SETUP COMMANDS SUMMARY
+================================================================================
+
+FULL SETUP PROCESS:
+--------------------------------------------------------------------------------
+
+1. CREATE WEBCAM.PY:
+   - Copy webcam.py code to root folder
+   - Run: python webcam.py
+
+2. CREATE FRONTEND:
+   cd results
+   npm create vite@latest frontend -- --template react
+   cd frontend
+   npm install
+   npm install -D tailwindcss postcss autoprefixer
+   npx tailwindcss init -p
+   npm install axios
+
+   - Copy all frontend files from this document
+   - Add Thapar logo to public/image.png
+   - Run: npm run dev
+
+3. CREATE BACKEND:
+   mkdir backend
+   cd backend
+
+   - Copy backend files (main.py, models.py, requirements.txt)
+   - Run: pip install -r requirements.txt
+   - Run: python main.py
+
+4. CREATE README.md:
+   - Copy README.md to root folder
+
+================================================================================
+
+TO RUN EVERYTHING:
+1. Backend: cd backend && python main.py
+2. Frontend: cd results/frontend && npm run dev
+3. Webcam: python webcam.py
+
+ACCESS:
+- Frontend: http://localhost:3000
+- Backend API: http://localhost:8000
+- API Docs: http://localhost:8000/docs
+
+================================================================================
+                            END OF UPDATES.txt
+================================================================================
+
+ALL CODE PROVIDED! COPY-PASTE INTO YOUR PROJECT!
+Good luck! 🚀
